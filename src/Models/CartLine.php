@@ -6,15 +6,19 @@ namespace Shopper\Cart\Models;
 
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
 use Illuminate\Database\Eloquent\Relations\MorphTo;
-use Shopper\Core\Models\Contracts\CartLine as CartLineContract;
+use Shopper\Cart\Database\Factories\CartLineFactory;
+use Shopper\Cart\Models\Contracts\CartLine as CartLineContract;
+use Shopper\Core\Models\Traits\HasPublicId;
 use Shopper\Core\Traits\HasModelContract;
 
 /**
  * @property-read int $id
+ * @property-read ?string $public_id
  * @property-read int $cart_id
  * @property-read string $purchasable_type
  * @property-read int $purchasable_id
@@ -24,13 +28,17 @@ use Shopper\Core\Traits\HasModelContract;
  * @property-read CarbonInterface $created_at
  * @property-read CarbonInterface $updated_at
  * @property-read Cart $cart
- * @property-read Model $purchasable
+ * @property-read ?Model $purchasable
  * @property-read Collection<int, CartLineAdjustment> $adjustments
  * @property-read Collection<int, CartLineTaxLine> $taxLines
  */
 class CartLine extends Model implements CartLineContract
 {
+    /** @use HasFactory<CartLineFactory> */
+    use HasFactory;
+
     use HasModelContract;
+    use HasPublicId;
 
     protected $guarded = [];
 
@@ -74,6 +82,11 @@ class CartLine extends Model implements CartLineContract
     public function taxLines(): HasMany
     {
         return $this->hasMany(CartLineTaxLine::class);
+    }
+
+    protected static function newFactory(): CartLineFactory
+    {
+        return CartLineFactory::new();
     }
 
     protected function casts(): array

@@ -6,35 +6,53 @@ namespace Shopper\Cart\Models;
 
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Collection;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Shopper\Cart\Database\Factories\CartFactory;
+use Shopper\Cart\Models\Contracts\Cart as CartContract;
 use Shopper\Core\Enum\AddressType;
 use Shopper\Core\Models\Channel;
-use Shopper\Core\Models\Contracts\Cart as CartContract;
+use Shopper\Core\Models\Order;
+use Shopper\Core\Models\PaymentMethod;
+use Shopper\Core\Models\Traits\HasPublicId;
 use Shopper\Core\Models\Zone;
 use Shopper\Core\Traits\HasModelContract;
 
 /**
  * @property-read int $id
+ * @property-read ?string $public_id
  * @property-read string $currency_code
- * @property-read ?string $coupon_code
+ * @property-read ?string $email
  * @property-read ?CarbonInterface $completed_at
  * @property-read ?array<string, mixed> $metadata
  * @property-read ?int $customer_id
  * @property-read ?int $channel_id
  * @property-read ?int $zone_id
+ * @property-read ?int $payment_method_id
+ * @property-read ?int $order_id
+ * @property-read ?string $shipping_option_id
+ * @property-read ?int $shipping_amount
+ * @property-read ?array<string, mixed> $payment_session
  * @property-read CarbonInterface $created_at
  * @property-read CarbonInterface $updated_at
  * @property-read Collection<int, CartLine> $lines
+ * @property-read Collection<int, CartPromotion> $promotions
  * @property-read Collection<int, CartAddress> $addresses
  * @property-read ?Model $customer
  * @property-read ?Channel $channel
  * @property-read ?Zone $zone
+ * @property-read ?PaymentMethod $paymentMethod
+ * @property-read ?Order $order
  */
 class Cart extends Model implements CartContract
 {
+    /** @use HasFactory<CartFactory> */
+    use HasFactory;
+
     use HasModelContract;
+    use HasPublicId;
 
     protected $guarded = [];
 
@@ -72,6 +90,14 @@ class Cart extends Model implements CartContract
     }
 
     /**
+     * @return HasMany<CartPromotion, $this>
+     */
+    public function promotions(): HasMany
+    {
+        return $this->hasMany(CartPromotion::class, 'cart_id');
+    }
+
+    /**
      * @return HasMany<CartAddress, $this>
      */
     public function addresses(): HasMany
@@ -103,11 +129,33 @@ class Cart extends Model implements CartContract
         return $this->belongsTo(Zone::class);
     }
 
+    /**
+     * @return BelongsTo<PaymentMethod, $this>
+     */
+    public function paymentMethod(): BelongsTo
+    {
+        return $this->belongsTo(PaymentMethod::class, 'payment_method_id');
+    }
+
+    /**
+     * @return BelongsTo<Order, $this>
+     */
+    public function order(): BelongsTo
+    {
+        return $this->belongsTo(Order::class, 'order_id');
+    }
+
+    protected static function newFactory(): CartFactory
+    {
+        return CartFactory::new();
+    }
+
     protected function casts(): array
     {
         return [
             'completed_at' => 'datetime',
             'metadata' => 'array',
+            'payment_session' => 'array',
         ];
     }
 }

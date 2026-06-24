@@ -6,13 +6,17 @@ namespace Shopper\Cart\Models;
 
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Casts\Attribute;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsTo;
+use Shopper\Cart\Database\Factories\CartAddressFactory;
 use Shopper\Core\Enum\AddressType;
 use Shopper\Core\Models\Country;
+use Shopper\Core\Models\Traits\HasPublicId;
 
 /**
  * @property-read int $id
+ * @property-read ?string $public_id
  * @property-read int $cart_id
  * @property-read AddressType $type
  * @property-read ?int $country_id
@@ -33,6 +37,11 @@ use Shopper\Core\Models\Country;
  */
 class CartAddress extends Model
 {
+    /** @use HasFactory<CartAddressFactory> */
+    use HasFactory;
+
+    use HasPublicId;
+
     protected $guarded = [];
 
     public function getTable(): string
@@ -45,7 +54,7 @@ class CartAddress extends Model
      */
     public function cart(): BelongsTo
     {
-        return $this->belongsTo(Cart::class);
+        return $this->belongsTo(config('shopper.cart.models.cart', Cart::class));
     }
 
     /**
@@ -54,6 +63,11 @@ class CartAddress extends Model
     public function country(): BelongsTo
     {
         return $this->belongsTo(Country::class);
+    }
+
+    protected static function newFactory(): CartAddressFactory
+    {
+        return CartAddressFactory::new();
     }
 
     /**

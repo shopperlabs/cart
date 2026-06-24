@@ -15,10 +15,12 @@ use Shopper\Cart\Exceptions\InsufficientStockException;
 use Shopper\Cart\Exceptions\InvalidDiscountException;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Models\CartLine;
+use Shopper\Cart\Models\CartLineAdjustment;
 use Shopper\Cart\Pipelines\CartPipelineContext;
 use Shopper\Cart\Pipelines\CartPipelineRunner;
 use Shopper\Core\Contracts\Priceable;
 use Shopper\Core\Enum\AddressType;
+use Shopper\Core\Enum\PromotionSource;
 use Shopper\Core\Models\Contracts\Stockable;
 use Shopper\Core\Models\Discount;
 use Throwable;
@@ -117,10 +119,80 @@ final readonly class CartManager
      */
     public function addAddress(Cart $cart, AddressType $type, array $data): void
     {
+        $this->guardCompleted($cart);
+
         $cart->addresses()->updateOrCreate(
             ['type' => $type],
             array_merge($data, ['type' => $type]),
         );
+    }
+
+    /**
+     * Bind a delivery choice to the cart. The option id is the composite
+     * `{carrier_code}:{service_code}` quoted by the shipping options endpoint
+     * and the amount is the server-resolved price, never a client value.
+     */
+    public function setShippingMethod(Cart $cart, string $optionId, int $amount): void
+    {
+        $this->guardCompleted($cart);
+
+        $cart->update([
+            'shipping_option_id' => $optionId,
+            'shipping_amount' => $amount,
+        ]);
+    }
+
+    public function setPaymentMethod(Cart $cart, int $paymentMethodId): void
+    {
+        $this->guardCompleted($cart);
+
+        $cart->update(['payment_method_id' => $paymentMethodId]);
+    }
+
+    public function setEmail(Cart $cart, string $email): void
+    {
+        $this->guardCompleted($cart);
+
+        $cart->update(['email' => $email]);
+    }
+
+    /**
+     * @param  array<string, mixed>|null  $metadata
+     */
+    public function setMetadata(Cart $cart, ?array $metadata): void
+    {
+        $this->guardCompleted($cart);
+
+        $cart->update(['metadata' => $metadata]);
+    }
+
+    /**
+     * Re-price the cart in another currency. Each line's unit price is resolved
+     * again from its purchasable, and the frozen checkout choices that are
+     * bound to the old currency (shipping price, payment session) are dropped
+     * so they are quoted again against the new total.
+     */
+    public function changeCurrency(Cart $cart, string $currencyCode): void
+    {
+        $this->guardCompleted($cart);
+
+        DB::transaction(function () use ($cart, $currencyCode): void {
+            $cart->loadMissing('lines.purchasable.prices');
+
+            foreach ($cart->lines as $line) {
+                $purchasable = $line->purchasable;
+                $price = $purchasable instanceof Priceable ? $purchasable->getPrice($currencyCode) : null;
+
+                $line->update(['unit_price_amount' => $price ? $price->amount : 0]);
+            }
+
+            $cart->update([
+                'currency_code' => $currencyCode,
+                'shipping_option_id' => null,
+                'shipping_amount' => null,
+                'payment_session' => null,
+            ]);
+        });
     }
 
     public function applyCoupon(Cart $cart, string $code): void
@@ -130,23 +202,36 @@ final readonly class CartManager
         $discount = Discount::query()->where('code', $code)->first();
 
         if (! $discount instanceof Discount) {
-            throw new InvalidDiscountException(__('shopper-cart::messages.discount.not_found'));
+            throw new InvalidDiscountException(__('shopper-cart::exceptions.discount_not_found'));
         }
 
-        $cart->update(['coupon_code' => $code]);
+        // A cart can carry several code promotions; the resolver decides which
+        // actually apply. The unique (cart_id, discount_id) row keeps re-applying
+        // the same code a no-op instead of a doubled discount.
+        $cart->promotions()->firstOrCreate(
+            ['discount_id' => $discount->id],
+            ['source' => PromotionSource::Code->value, 'code' => $code],
+        );
 
         CouponApplied::dispatch($cart, $code);
     }
 
-    public function removeCoupon(Cart $cart): void
+    /**
+     * Remove a code promotion from the cart. A null code clears every applied
+     * code promotion; a given code removes only that one.
+     */
+    public function removeCoupon(Cart $cart, ?string $code = null): void
     {
         $this->guardCompleted($cart);
 
-        $cart->update(['coupon_code' => null]);
+        $cart->promotions()
+            ->where('source', PromotionSource::Code->value)
+            ->when($code !== null, fn ($query) => $query->where('code', $code))
+            ->delete();
 
-        foreach ($cart->lines as $line) {
-            $line->adjustments()->delete();
-        }
+        CartLineAdjustment::query()
+            ->whereIn('cart_line_id', $cart->lines()->select('id'))
+            ->delete();
 
         CouponRemoved::dispatch($cart);
     }
@@ -161,7 +246,7 @@ final readonly class CartManager
     private function guardQuantity(int $quantity): void
     {
         if ($quantity < 1) {
-            throw new InvalidArgumentException(__('Quantity must be at least 1.'));
+            throw new InvalidArgumentException(__('shopper-cart::exceptions.quantity_minimum'));
         }
     }
 
