@@ -13,6 +13,7 @@ use Shopper\Cart\CartManager;
 use Shopper\Cart\Events\CartCompleted;
 use Shopper\Cart\Exceptions\CartCompletedException;
 use Shopper\Cart\Exceptions\DiscountLimitReachedException;
+use Shopper\Cart\Exceptions\InsufficientStockException;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Models\CartAddress;
 use Shopper\Cart\Models\CartPromotion;
@@ -20,9 +21,11 @@ use Shopper\Cart\Models\Contracts\Cart as CartContract;
 use Shopper\Cart\Pipelines\CartPipelineContext;
 use Shopper\Core\Actions\CreateOrderTaxLinesAction;
 use Shopper\Core\Actions\ReserveCampaignBudget;
+use Shopper\Core\Contracts\StockReserver;
 use Shopper\Core\Models\CarrierOption;
 use Shopper\Core\Models\Contracts\Order;
 use Shopper\Core\Models\Contracts\ProductVariant;
+use Shopper\Core\Models\Contracts\Stockable;
 use Shopper\Core\Models\Discount;
 use Shopper\Core\Models\OrderAddress;
 use Shopper\Core\Models\OrderPromotion;
@@ -35,6 +38,7 @@ final readonly class CreateOrderFromCartAction
         private CartManager $cartManager,
         private CreateOrderTaxLinesAction $createOrderTaxLines,
         private ReserveCampaignBudget $reserveCampaignBudget,
+        private StockReserver $stockReserver,
     ) {}
 
     /**
@@ -65,8 +69,6 @@ final readonly class CreateOrderFromCartAction
                 ->sortBy('sequence')
                 ->values();
 
-            // The largest applied promotion is mirrored on the legacy order
-            // discount_* columns; order_promotions carries the full set.
             $primary = $applied->sortByDesc('computed_amount')->first();
             $primaryDiscount = $primary?->discount;
 
@@ -74,7 +76,6 @@ final readonly class CreateOrderFromCartAction
             $billingAddress = $this->createOrderAddress($cart->billingAddress(), $cart->customer_id);
 
             $order = resolve(Order::class)::query()->create([
-                'number' => generate_number(),
                 'price_amount' => $context->total,
                 'tax_amount' => $context->taxTotal,
                 'shipping_amount' => $cart->shipping_amount,
@@ -111,6 +112,22 @@ final readonly class CreateOrderFromCartAction
                     'product_type' => $line->purchasable_type,
                     'product_id' => $line->purchasable_id,
                 ]);
+
+                // Reserve stock under a row lock inside the order transaction:
+                // a shortfall aborts the whole checkout so two buyers can never
+                // both claim the last unit. Back-ordered lines always reserve.
+                if ($purchasable instanceof Stockable && $purchasable->tracksInventory()) {
+                    $reserved = $this->stockReserver->reserve(
+                        $purchasable,
+                        $line->quantity,
+                        $order,
+                        $cart->customer_id,
+                    );
+
+                    if ($reserved < $line->quantity) {
+                        throw new InsufficientStockException($purchasable, $reserved, $line->quantity);
+                    }
+                }
             }
 
             $this->createOrderTaxLines->execute($order);
@@ -175,10 +192,13 @@ final readonly class CreateOrderFromCartAction
                 continue;
             }
 
-            if ($discount->usage_limit_per_user && $cart->customer_id !== null) {
-                $alreadyRedeemed = OrderPromotion::query()
+            if ($discount->usage_limit_per_user) {
+                $column = $cart->customer_id !== null ? 'customer_id' : 'email';
+                $value = $cart->customer_id ?? $cart->email;
+
+                $alreadyRedeemed = $value !== null && OrderPromotion::query()
                     ->where('discount_id', $discount->id)
-                    ->whereHas('order', fn (Builder $query) => $query->where('customer_id', $cart->customer_id))
+                    ->whereHas('order', fn (Builder $query) => $query->where($column, $value))
                     ->exists();
 
                 if ($alreadyRedeemed) {
