@@ -14,13 +14,14 @@ use Shopper\Cart\Events\CartCompleted;
 use Shopper\Cart\Exceptions\CartCompletedException;
 use Shopper\Cart\Exceptions\DiscountLimitReachedException;
 use Shopper\Cart\Exceptions\InsufficientStockException;
+use Shopper\Cart\Exceptions\PriceChangedException;
 use Shopper\Cart\Models\Cart;
 use Shopper\Cart\Models\CartAddress;
 use Shopper\Cart\Models\CartPromotion;
 use Shopper\Cart\Models\Contracts\Cart as CartContract;
 use Shopper\Cart\Pipelines\CartPipelineContext;
-use Shopper\Core\Actions\CreateOrderTaxLinesAction;
 use Shopper\Core\Actions\ReserveCampaignBudget;
+use Shopper\Core\Contracts\Priceable;
 use Shopper\Core\Contracts\StockReserver;
 use Shopper\Core\Models\CarrierOption;
 use Shopper\Core\Models\Contracts\Order;
@@ -29,14 +30,15 @@ use Shopper\Core\Models\Contracts\Stockable;
 use Shopper\Core\Models\Discount;
 use Shopper\Core\Models\OrderAddress;
 use Shopper\Core\Models\OrderPromotion;
+use Shopper\Core\Models\OrderTaxLine;
 use Shopper\Core\Models\ProductVariant as ProductVariantModel;
+use Shopper\Core\Pricing\PricingContext;
 use Throwable;
 
 final readonly class CreateOrderFromCartAction
 {
     public function __construct(
         private CartManager $cartManager,
-        private CreateOrderTaxLinesAction $createOrderTaxLines,
         private ReserveCampaignBudget $reserveCampaignBudget,
         private StockReserver $stockReserver,
     ) {}
@@ -45,18 +47,24 @@ final readonly class CreateOrderFromCartAction
      * @param  Closure(CartPipelineContext): void|null  $assertTotals  Runs against
      *                                                                 the totals computed under the cart lock, right before the order
      *                                                                 freezes them. Throw to abort: the transaction rolls back.
+     * @param  Closure(Order): void|null  $afterCreate  Runs on the created order inside
+     *                                                  the same transaction, so anything it persists
+     *                                                  (like the payment reference) commits or rolls
+     *                                                  back atomically with the order.
      *
      * @throws Throwable
      */
-    public function execute(Cart $cart, ?Closure $assertTotals = null): Order
+    public function execute(Cart $cart, ?Closure $assertTotals = null, ?Closure $afterCreate = null): Order
     {
-        return DB::transaction(function () use ($cart, $assertTotals): Order {
+        return DB::transaction(function () use ($cart, $assertTotals, $afterCreate): Order {
             /** @var Cart $cart */
             $cart = resolve(CartContract::class)::query()->lockForUpdate()->findOrFail($cart->id);
 
             if ($cart->isCompleted()) {
                 throw new CartCompletedException;
             }
+
+            $this->revalidatePrices($cart);
 
             $context = $this->cartManager->calculate($cart);
 
@@ -99,23 +107,44 @@ final readonly class CreateOrderFromCartAction
                 ProductVariantModel::class => ['product'],
             ]);
 
-            foreach ($cart->lines as $line) {
+            $cart->lines->load('taxLines');
+            $orderTaxLines = [];
+
+            $lines = $cart->lines->sortBy([
+                ['purchasable_type', 'asc'],
+                ['purchasable_id', 'asc'],
+            ])->values();
+
+            foreach ($lines as $line) {
                 $discountAmount = $line->adjustments->sum('amount');
                 $purchasable = $line->purchasable;
+                $taxLines = $line->taxLines;
 
-                $order->items()->create([
+                $item = $order->items()->create([
                     'name' => $this->resolveItemName($purchasable),
                     'sku' => $purchasable->sku ?? '',
                     'quantity' => $line->quantity,
                     'unit_price_amount' => $line->unit_price_amount,
                     'discount_amount' => $discountAmount,
+                    'tax_amount' => (int) $taxLines->sum('amount'),
                     'product_type' => $line->purchasable_type,
                     'product_id' => $line->purchasable_id,
                 ]);
 
-                // Reserve stock under a row lock inside the order transaction:
-                // a shortfall aborts the whole checkout so two buyers can never
-                // both claim the last unit. Back-ordered lines always reserve.
+                foreach ($taxLines as $taxLine) {
+                    $orderTaxLines[] = [
+                        'taxable_type' => $item->getMorphClass(),
+                        'taxable_id' => $item->id,
+                        'code' => $taxLine->code,
+                        'name' => $taxLine->name,
+                        'rate' => $taxLine->rate,
+                        'amount' => $taxLine->amount,
+                        'tax_rate_id' => $taxLine->tax_rate_id,
+                        'created_at' => now(),
+                        'updated_at' => now(),
+                    ];
+                }
+
                 if ($purchasable instanceof Stockable && $purchasable->tracksInventory()) {
                     $reserved = $this->stockReserver->reserve(
                         $purchasable,
@@ -130,11 +159,17 @@ final readonly class CreateOrderFromCartAction
                 }
             }
 
-            $this->createOrderTaxLines->execute($order);
+            if ($orderTaxLines !== []) {
+                OrderTaxLine::query()->insert($orderTaxLines);
+            }
 
             $this->reservePromotions($applied, $cart, $order);
 
             $order->refresh();
+
+            if ($afterCreate) {
+                $afterCreate($order);
+            }
 
             $cart->update([
                 'completed_at' => now(),
@@ -145,6 +180,47 @@ final readonly class CreateOrderFromCartAction
 
             return $order;
         });
+    }
+
+    private function revalidatePrices(Cart $cart): void
+    {
+        $cart->loadMissing('lines.purchasable.prices');
+
+        foreach ($cart->lines as $line) {
+            $purchasable = $line->purchasable;
+
+            if (! $purchasable instanceof Priceable) {
+                continue;
+            }
+
+            $price = $purchasable->resolvePrice(new PricingContext(
+                currencyCode: $cart->currency_code,
+                customerId: $cart->customer_id,
+                quantity: $line->quantity,
+                channelId: $cart->channel_id,
+                zoneId: $cart->zone_id,
+            ));
+
+            // No resolvable live price means the price cannot be revalidated,
+            // not that it dropped to zero: keep the frozen amount. A genuinely
+            // free item carries a zero-amount price row and is revalidated.
+            if ($price === null) {
+                continue;
+            }
+
+            $live = (int) $price->amount;
+            $frozen = (int) $line->unit_price_amount;
+
+            if ($live === $frozen) {
+                continue;
+            }
+
+            if ($live > $frozen) {
+                throw new PriceChangedException($purchasable, $frozen, $live);
+            }
+
+            $line->update(['unit_price_amount' => $live]);
+        }
     }
 
     /**
